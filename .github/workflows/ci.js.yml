@@ -1,35 +1,278 @@
-# This workflow will do a clean installation of node dependencies, cache/restore them, build the source code and run tests across different versions of node
-# For more information see: https://docs.github.com/en/actions/automating-builds-and-tests/building-and-testing-nodejs
+# =============================================================================
+# Workflow de CI deste treino
+# =============================================================================
+# Workflow = este arquivo YAML.
+# O GitHub so executa o que esta em .github/workflows/
+#
+# No mercado isso tambem e chamado de pipeline.
+# No GitHub Actions o nome oficial e workflow.
+#
+# Este arquivo cobre 4 jobs:
+#   1) lint        -> ESLint no back e no front (qualidade do codigo, sem banco)
+#   2) unit        -> testes unitarios do back (sem banco)
+#   3) integracao  -> testes de integracao do back (com Postgres)
+#   4) cypress     -> teste ponta a ponta no browser (API + front + banco)
+#
+# Os jobs comecam juntos. Cada um ganha uma maquina Ubuntu nova.
+# O Postgres de um job NAO e o Postgres do outro.
+# =============================================================================
 
-name: Aula 19
+# Nome que aparece na aba Actions do GitHub
+name: Node.js CI
 
+# Gatilhos: quando este workflow roda
 on:
+  # Qualquer push na branch main
   push:
     branches: [ "main" ]
+  # Qualquer pull request apontando para main
   pull_request:
     branches: [ "main" ]
 
 jobs:
-  unit:
+  # ---------------------------------------------------------------------------
+  # Job: lint (ESLint)
+  # ---------------------------------------------------------------------------
+  # Nao executa a API e nao usa banco.
+  # Le o codigo e procura problemas estaticos, por exemplo:
+  # - variavel usada sem declarar
+  # - codigo que nunca roda
+  # - == em vez de ===
+  # - no front: Hook do React usado fora do componente
+  #
+  # Util na aula: o teste pode passar e o lint falhar (ou o contrario).
+  # Sao checagens diferentes.
+  #
+  # Este job olha BACK e FRONT. Se um dos dois falhar, o job fica vermelho.
+  lint:
+    # Maquina limpa do GitHub (Ubuntu)
+    runs-on: ubuntu-latest
 
+    steps:
+      # Baixa o codigo deste commit para a maquina do job
+      - uses: actions/checkout@v4
+
+      # Instala o Node 22 nesta maquina
+      - name: Use Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          # Guarda cache do npm entre execucoes (mais rapido no proximo push)
+          cache: 'npm'
+          # Como nao ha package-lock na raiz, apontamos os dois locks
+          cache-dependency-path: |
+            backend/package-lock.json
+            frontend/package-lock.json
+
+      # working-directory = roda o comando dentro da pasta backend/
+      - name: Instala o back
+        working-directory: backend
+        # npm ci = instala exatamente as versoes do package-lock.json
+        run: npm ci
+
+      - name: Instala o front
+        working-directory: frontend
+        run: npm ci
+
+      # Usa backend/eslint.config.js
+      - name: ESLint do back
+        working-directory: backend
+        run: npm run lint
+
+      # Usa frontend/eslint.config.js
+      - name: ESLint do front
+        working-directory: frontend
+        run: npm run lint
+
+  # ---------------------------------------------------------------------------
+  # Job: unit (testes unitarios)
+  # ---------------------------------------------------------------------------
+  # Nao usa banco. So testa a funcao pura resumirAlunos.
+  # A strategy.matrix repete o mesmo job em 3 versoes do Node.
+  # Por isso na aba Actions aparecem 3 quadrados "unit (18.x/20.x/22.x)".
+  unit:
     runs-on: ubuntu-latest
 
     strategy:
       matrix:
+        # Cada valor vira um job separado com a mesma lista de steps
         node-version: [18.x, 20.x, 22.x]
-        # See supported Node.js release schedule at https://nodejs.org/en/about/releases/
 
     steps:
-    - uses: actions/checkout@v4
-    - name: Use Node.js ${{ matrix.node-version }}
-      uses: actions/setup-node@v4
-      with:
-        node-version: ${{ matrix.node-version }}
-        cache: 'npm'
-        cache-dependency-path: backend/package-lock.json
-    - name: Instalacao do back
-      working-directory: backend
-      run: npm ci
-    - name: Testes Unitarios
-      working-directory: backend 
-      run: npm run test:unit
+      - uses: actions/checkout@v4
+
+      # ${{ matrix.node-version }} pega 18.x, depois 20.x, depois 22.x
+      - name: Use Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: 'npm'
+          # O package-lock esta em backend/, nao na raiz do repo
+          cache-dependency-path: backend/package-lock.json
+
+      - name: Instala o back
+        working-directory: backend
+        run: npm ci
+
+      # Roda so o Jest unitario (pasta tests/unit)
+      - name: Testes unitarios
+        working-directory: backend
+        run: npm run test:unit
+
+  # ---------------------------------------------------------------------------
+  # Job: integracao (testes de integracao)
+  # ---------------------------------------------------------------------------
+  # Este job sobe um Postgres sozinho (bloco services).
+  # Esse banco NAO e o Docker da sua maquina.
+  # Ele nasce com o job e some quando o job termina.
+  #
+  # Credenciais locais (docker-compose.yml):
+  #   usuario_local / senha_local / porta 5434 / banco_alunos
+  #
+  # Credenciais deste job (abaixo):
+  #   usuario_ci / senha_ci / porta 5432 / banco_alunos
+  #
+  # Sao diferentes de proposito: local e CI sao ambientes separados.
+  integracao:
+    runs-on: ubuntu-latest
+
+    # service = container auxiliar ligado a este job
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          # Usuario/senha/banco criados DENTRO deste container do CI
+          POSTGRES_USER: usuario_ci
+          POSTGRES_PASSWORD: senha_ci
+          POSTGRES_DB: banco_alunos
+        ports:
+          # Porta do container -> porta da maquina do job
+          - 5432:5432
+        # O job so continua quando o Postgres aceitar conexao
+        options: >-
+          --health-cmd "pg_isready -U usuario_ci -d banco_alunos"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      # Variavel disponivel em TODOS os steps deste job.
+      # A API le DATABASE_URL. Se ela existir, ignora o padrao do db.js.
+      DATABASE_URL: postgres://usuario_ci:senha_ci@127.0.0.1:5432/banco_alunos
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Use Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: 'npm'
+          cache-dependency-path: backend/package-lock.json
+
+      - name: Instala o back
+        working-directory: backend
+        run: npm ci
+
+      # Cria a tabela alunos e insere Ana, Bruno e Carla
+      - name: Cria a tabela e os 3 alunos
+        working-directory: backend
+        run: npm run migrate
+
+      # Chama GET /api/alunos de verdade e espera os 3 nomes
+      - name: Testes de integracao
+        working-directory: backend
+        run: npm run test:integration
+
+  # ---------------------------------------------------------------------------
+  # Job: cypress (ponta a ponta)
+  # ---------------------------------------------------------------------------
+  # Fluxo completo:
+  #   Postgres -> migration -> API Express -> Vite/React -> Cypress no browser
+  #
+  # O Cypress abre a tela, espera 3 <li> e confere Ana, Bruno e Carla.
+  # Nao e o mesmo Postgres do job "integracao": cada job tem a sua maquina.
+  #
+  # Detalhe importante do Actions:
+  # processo deixado em segundo plano (&) morre quando o step acaba.
+  # Por isso API, Vite e Cypress ficam NO MESMO step.
+  cypress:
+    name: Cypress ponta a ponta
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: usuario_ci
+          POSTGRES_PASSWORD: senha_ci
+          POSTGRES_DB: banco_alunos
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U usuario_ci -d banco_alunos"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      # Mesma ideia do job integracao: a API usa este endereco no CI
+      DATABASE_URL: postgres://usuario_ci:senha_ci@127.0.0.1:5432/banco_alunos
+      # Porta em que o Express sobe neste job
+      PORT: 3001
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Use Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: 'npm'
+          # Cache dos dois package-lock: back e front
+          cache-dependency-path: |
+            backend/package-lock.json
+            frontend/package-lock.json
+
+      - name: Instala o back
+        working-directory: backend
+        run: npm ci
+
+      - name: Instala o front
+        working-directory: frontend
+        run: npm ci
+
+      # Confere se o front compila antes de abrir o browser
+      - name: Confere se o front compila
+        working-directory: frontend
+        run: npm run build
+
+      - name: Cria a tabela e os 3 alunos
+        working-directory: backend
+        run: npm run migrate
+
+      # Este step faz 4 coisas na mesma maquina:
+      # 1) sobe a API em segundo plano
+      # 2) sobe o Vite na porta 5180 (a mesma do cypress.config.js)
+      # 3) espera os dois responderem (loop com curl)
+      # 4) roda o Cypress
+      - name: Sobe a stack e roda o Cypress
+        run: |
+          npm start --prefix backend &
+          npm run dev --prefix frontend -- --host 127.0.0.1 --port 5180 &
+
+          pronta=0
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:3001/health >/dev/null && curl -sf http://127.0.0.1:5180 >/dev/null; then
+              pronta=1
+              break
+            fi
+            sleep 1
+          done
+
+          if [ "$pronta" -ne 1 ]; then
+            echo "A API ou o front nao subiu a tempo."
+            exit 1
+          fi
+
+          npm run e2e --prefix frontend
